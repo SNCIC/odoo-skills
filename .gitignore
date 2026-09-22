@@ -1,0 +1,38 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+
+# ---- 本地开发 / 部署残留 ----
+*.bak
+*.bak_*
+*.orig
+*.rej
+*.log
+
+# ---- 编辑器 / 系统 ----
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.swp
+*~
+
+# ---- 环境与凭证 ----
+# 注意：odoo-json2-operator/scripts/connections.json 是**空模板**，必须保留入库，
+# 所以这里刻意不按文件名忽略它 —— 真实凭证不要写进该文件，另放本地 .env / 本地未跟踪副本。
+.env
+.env.*
+!.env.example
+*.pem
+
+# ---- WorkBuddy 本地工作区数据（记忆、缓存等）----
+.workbuddy/
