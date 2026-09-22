@@ -1,0 +1,3 @@
+interface:
+  display_name: "Odoo zh_CN Translation"
+  short_description: "Find and fill untranslated Odoo Chinese strings"
