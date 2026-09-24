@@ -376,6 +376,28 @@ when running from a WorkBuddy session.
    look-alike character (`-` vs `‑`, `&` vs `&amp;`). `odoo20tbb` unified 5
    conflicts this way.
 
+   **The build overwrites `--module-dir/i18n/<lang>.po` wholesale -- it does not
+   merge into it.** Passing a *single* worklist while `--module-dir` points at
+   the overlay therefore discards every term the overlay already holds; the
+   command is only safe with the whole worklist directory (which is what the
+   command above does) or with a module directory whose po does not exist yet.
+   Before pointing it at the overlay with an unusual set of paths, count the
+   msgids that are in the overlay but not in the worklists -- if that set is
+   not empty, the build would delete them.
+
+   **A project's own module should ship its own `i18n/<lang>.po` instead of
+   going through the overlay.** Build it the same way, with `--module-dir`
+   pointing at the module itself and only that module's worklist as input;
+   `-u <module>` then imports it (look for `loading translation file ...` in the
+   log). Two reasons this beats an overlay entry: the module's wording cannot
+   collide with the overlay's (a po holds one translation per msgid, and shared
+   vocabulary like `Action` / `Active` is exactly where a new module's natural
+   wording differs from what the established modules shipped), and the
+   translations travel with the module when it is deployed elsewhere. Two
+   collisions on `odoo20tbb`'s `sn_miniapp_order` -- `Action` (`动作` vs `操作`)
+   and `Active` (`启用` vs `有效`) -- were real semantic differences, not
+   mistakes, and were the reason to take this route.
+
 7. **Load.** Stop the unit, upgrade, start it again (the project AGENTS.md rule:
    never run `-i` / `-u` while the service is up), then check the service and the
    login page:
@@ -491,6 +513,28 @@ once with `-i sn_odoo20_translations --stop-after-init` (service stopped).
 - `scripts/i18n_set.py` -- apply a batch of translations at once
   (`apply --map map.json`), when the wording is decided and hand-editing many
   worklists would be the slow part; run `check` afterwards anyway.
+
+## Scripting notes (worklist-editing scripts)
+
+Scripts that edit worklists in bulk are the fast path, and three things bite:
+
+- **`polib.POEntry.fuzzy` has no setter.** Clear the flag through
+  `entry.flags.remove('fuzzy')`, not `entry.fuzzy = False`
+  (`AttributeError: property 'fuzzy' of 'POEntry' object has no setter`).
+- **A worklist from `i18n_db_audit.py --out-dir` already carries the `msgstr`
+  of its `+` group** ("translated somewhere, but no po entry points at the
+  record"). Only the *translated nowhere yet* group is empty, so a script that
+  fills every blank is doing exactly the right amount of work -- do not
+  overwrite what is already there. The list is deduplicated by msgid, so its
+  entry count is lower than the audit's record count: check coverage with
+  `grep -c '^#: model:' <module>.po`, which must equal the audit's total.
+- **Deciding whether a term deserves translating at all**: grep the official
+  po files for the msgid and look at how the tree already renders it. `ID`
+  appears with `msgstr == msgid` in 333 places -- that is a decision taken
+  tree-wide, so it belongs in `_intentional.txt`, not in a translation.
+  `i18n_code_audit.py` never reports such a term as a gap on its own: its
+  `interesting()` filter drops strings that are already CJK, which is why a
+  module whose user-facing strings are written in Chinese scans clean.
 - `scripts/i18n_apply.py` -- `check` (with `--baseline`) and `build` (never
   touches upstream).
 - `scripts/i18n_common.py` -- shared helpers, imported by all of the above:
