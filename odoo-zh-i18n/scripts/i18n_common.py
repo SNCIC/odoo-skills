@@ -12,6 +12,7 @@ how a language maps to files -- ``odoo.tools.translate.get_po_paths`` reads
 from __future__ import annotations
 
 import re
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -25,11 +26,19 @@ TERMS_HTML = "terms_html"        # same, but containing markup
 DESCRIPTION = "description"      # module long description in the Apps store
 OTHER = "other"
 ALL_CATEGORIES = (CODE, FIELD, TERMS, TERMS_HTML, DESCRIPTION, OTHER)
-DEFAULT_CATEGORIES = (CODE, FIELD, TERMS)
+# HTML view/mail terms are user-visible text like any other: leaving them out of
+# the default would make the documented scan under-report by hundreds of terms.
+DEFAULT_CATEGORIES = (CODE, FIELD, TERMS, TERMS_HTML)
 
 CJK_RE = re.compile(r"[\u3000-\u9fff\uf900-\ufaff]")
 LETTER_RE = re.compile(r"[A-Za-z]")
 MARKUP_RE = re.compile(r"</?[A-Za-z][A-Za-z0-9]*")
+# The long Apps-store blurb of a module.  No language translates it -- every
+# upstream po ships the entry with an empty msgstr -- so it has a category of
+# its own, kept out of the worklists unless the caller asks for it.  The
+# *short* description and the summary are not in this class: the instance
+# imports them from the po entry that names ``base.module_<name>`` and shows
+# them in the Apps list, so they are ordinary one-line terms.
 MODULE_DESCRIPTION_RE = re.compile(r"model:ir\.module\.module,description:")
 MODULE_COMMENT_RE = re.compile(r"^module[s]?:\s*(\w+)\s*$")
 # Printer control code: ZPL (the label templates of product/stock keep the raw
@@ -42,7 +51,7 @@ INTENTIONAL_FILENAME = "_intentional.txt"
 
 
 def read_intentional(paths: list[Path]) -> dict[str, str]:
-    """Terms a project deliberately keeps in English, by msgid -> reason.
+    r"""Terms a project deliberately keeps in English, by msgid -> reason.
 
     Brand names, paper sizes, printer control codes and single-letter keyboard
     shortcuts have no translation in any language.  Listing them once (one msgid
@@ -51,6 +60,11 @@ def read_intentional(paths: list[Path]) -> dict[str, str]:
     the coverage report is still a list of genuine work instead of a list of
     decisions already taken.  Each ``path`` is either such a file or a directory
     holding a default-named ``_intentional.txt``.
+
+    A msgid may itself contain ``#`` -- ``iPhone #1``, ``# of Blocks`` -- and the
+    plain ``partition("#")`` would cut the declaration in the middle of the term
+    (the term would never match anything).  ``\#`` declares such a term; only an
+    unescaped ``#`` starts the reason.
     """
     found: dict[str, str] = {}
     for raw in paths:
@@ -61,9 +75,45 @@ def read_intentional(paths: list[Path]) -> dict[str, str]:
             line = raw.strip()
             if not line or line.startswith("#"):
                 continue
-            msgid, _, reason = line.partition("#")
-            found[msgid.strip()] = reason.strip()
+            head, separator, reason = split_declaration(line)
+            msgid = unescape_msgid(head.strip())
+            found[msgid] = reason.strip() if separator else ""
     return found
+
+
+def split_declaration(line: str) -> tuple[str, str, str]:
+    r"""Split one ``msgid [# reason]`` line on the first *unescaped* ``#``.
+
+    The head keeps its ``\#`` so ``unescape_msgid`` can see the escape; callers
+    turn it into a literal ``#`` afterwards.  Returns ``(head, separator,
+    reason)``, the separator being empty when the line declares no reason.
+    """
+    match = re.search(r"(?<!\\)#", line)
+    if match is None:
+        return line, "", ""
+    return line[:match.start()], "#", line[match.end():]
+
+
+def unescape_msgid(text: str) -> str:
+    """Turn the ``\\n`` / ``\\t`` / ``\\\\`` escapes of a declaration into characters.
+
+    A view-arch term is usually several lines long (``<span>`` per line), and
+    ``_intentional.txt`` is read line by line, so the newlines have to be
+    written as escapes there.  Anything else is taken literally.
+    """
+    out: list[str] = []
+    index = 0
+    while index < len(text):
+        char = text[index]
+        if char == "\\" and index + 1 < len(text):
+            following = text[index + 1]
+            if following in "nt\\#":
+                out.append({"n": "\n", "t": "\t", "#": "#"}.get(following, "\\"))
+                index += 2
+                continue
+        out.append(char)
+        index += 1
+    return "".join(out)
 
 
 def base_langs(lang: str) -> list[str]:
@@ -251,3 +301,97 @@ def po_header(lang: str, generator: str, title: str | None = None) -> str:
     if title:
         header = "".join(f"# {line}\n" for line in title.split("\n")) + "\n" + header
     return header
+
+
+def exposes_odoo_package(directory: Path) -> bool:
+    """Whether ``directory`` can go on ``sys.path`` to make ``import odoo`` work.
+
+    Three things have to hold, and each one has bitten a caller already: the
+    directory must *contain* the package (adding the package directory itself
+    shadows the ``logging`` and ``http`` modules Odoo imports, and the import
+    then dies with a circular-import error that names neither), the package must
+    be there at all, and it must be recognised as Odoo -- ``release.py`` is the
+    marker rather than ``__init__.py`` because 20.0 renames that file to
+    ``init.py`` and relies on the directory being a namespace package.
+    """
+    package = directory / "odoo"
+    return (package / "release.py").is_file() and (package / "tools").is_dir()
+
+
+def looks_like_addons_dir(path: Path) -> bool:
+    """Whether ``path`` holds at least one module."""
+    if not path.is_dir():
+        return False
+    return any((child / "__manifest__.py").is_file()
+               for child in path.iterdir() if child.is_dir())
+
+
+def resolve_addons_paths(conf: Path | None = None, root: Path | None = None,
+                         extra: list[Path] = ()) -> tuple[list[Path], str]:
+    """Every addons directory the project's Odoo loads, and how they were found.
+
+    Odoo loads the ``addons_path`` of its configuration file *and* its own
+    ``odoo/addons`` package directory, which no configuration file mentions.
+    That directory is where ``base`` lives, so a scan that only knows the
+    configured paths silently reports "nothing to translate" for the core
+    modules -- the biggest blind spot of a po-based scan.
+
+    Importing Odoo is the only exact answer; parsing the configuration file and
+    its conventional siblings is the fallback for a python that cannot import
+    the source tree.  Returns the directories plus a short label of the source
+    (``odoo``, ``config`` or ``none``) so the caller can report which one it
+    used.
+    """
+    candidates: list[Path] = []
+
+    # ``root`` is documented as the project directory (which holds an ``odoo``
+    # source tree) *or* that source tree itself, so both are candidates;
+    # ``exposes_odoo_package`` keeps the one that must not go on sys.path off
+    # it.
+    if root:
+        for candidate in (root, root / "odoo"):
+            if exposes_odoo_package(candidate) and str(candidate) not in sys.path:
+                sys.path.insert(0, str(candidate))
+    try:
+        from odoo.modules import module as odoo_module
+        from odoo.tools import config as odoo_config
+
+        if conf and conf.is_file():
+            odoo_config.parse_config(["-c", str(conf)])
+        odoo_module.initialize_sys_path()
+        import odoo.addons
+
+        found = [Path(directory) for directory in getattr(odoo.addons, "__path__", [])]
+        if found and any(looks_like_addons_dir(directory) for directory in found):
+            return found, "odoo"
+    except BaseException:  # noqa: BLE001 - any failure means "fall back"
+        pass
+
+    if conf and conf.is_file():
+        import configparser
+
+        parser = configparser.RawConfigParser()
+        try:
+            parser.read(str(conf))
+            raw = parser.get("options", "addons_path", fallback="")
+        except configparser.Error:
+            raw = ""
+        for field in raw.split(","):
+            if field.strip():
+                candidates.append(Path(field.strip()))
+
+    resolved: list[Path] = []
+    for directory in candidates + list(extra):
+        siblings = [
+            directory,
+            directory / "odoo" / "addons",
+            directory.parent / "odoo" / "addons",
+            directory.parent / "addons",
+        ]
+        for sibling in siblings:
+            if looks_like_addons_dir(sibling) and sibling not in resolved:
+                resolved.append(sibling)
+    for directory in extra:
+        if looks_like_addons_dir(directory) and directory not in resolved:
+            resolved.append(directory)
+    return resolved, "config" if resolved else "none"

@@ -32,6 +32,7 @@ Run it with the interpreter that has polib -- for these projects, the Odoo venv:
 from __future__ import annotations
 
 import argparse
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -40,6 +41,7 @@ import polib
 
 from i18n_common import (
     ALL_CATEGORIES,
+    INTENTIONAL_FILENAME,
     CJK_RE,
     CONTROL_CODE_RE,
     DEFAULT_CATEGORIES,
@@ -48,10 +50,12 @@ from i18n_common import (
     find_pot,
     iter_modules,
     read_intentional,
+    looks_like_addons_dir,
     po_candidates,
     po_header,
     read_overlay,
     read_translations,
+    resolve_addons_paths,
 )
 
 GENERATOR = "i18n_scan.py (odoo-zh-i18n)"
@@ -132,6 +136,37 @@ def scan_module(module: str, module_dir: Path, args, stats: dict,
     return entries
 
 
+def fold_by_msgid(entries: list[polib.POEntry]) -> list[polib.POEntry]:
+    """One entry per msgid, with the occurrences and comments of all of them.
+
+    A po file cannot hold the same msgid twice, and every occurrence of an entry
+    shares its translation.  The instance audit produces the same English text
+    once per record it is still served on, so its worklist has to be folded
+    before it is written; an already translated msgstr wins over a prefill.
+    """
+    folded: dict[str, polib.POEntry] = {}
+    order: list[str] = []
+    for entry in entries:
+        existing = folded.get(entry.msgid)
+        if existing is None:
+            folded[entry.msgid] = entry
+            order.append(entry.msgid)
+            continue
+        if not existing.msgstr.strip():
+            existing.msgstr = entry.msgstr
+        comments = (existing.comment or "").split("\n")
+        for line in (entry.comment or "").split("\n"):
+            if line and line not in comments:
+                comments.append(line)
+        existing.comment = "\n".join(comments)
+        known = [list(occurrence) for occurrence in existing.occurrences]
+        for occurrence in entry.occurrences:
+            if list(occurrence) not in known:
+                existing.occurrences.append(occurrence)
+                known.append(list(occurrence))
+    return [folded[msgid] for msgid in order]
+
+
 def merge_with_archive(path: Path, fresh: list[polib.POEntry],
                        prune: bool = True) -> list[polib.POEntry]:
     """Keep everything a previous pass already translated, add the new terms.
@@ -140,6 +175,12 @@ def merge_with_archive(path: Path, fresh: list[polib.POEntry],
     produces -- the term left the pot, or a filter (category, printer control
     code, module not installed) now excludes it -- is dropped, so the archive
     stays a list of what still needs work.  Translations are never dropped.
+
+    A msgid the archive already holds is *folded into* that entry rather than
+    dropped: a later pass can know an occurrence the earlier one did not (the
+    instance audit looks at records a pot never listed, so the same text turns
+    up on records the scan never named), and a prefill may fill a stub the
+    archive kept empty.  An existing translation is never overwritten.
     """
     if not path.is_file():
         return fresh
@@ -149,10 +190,28 @@ def merge_with_archive(path: Path, fresh: list[polib.POEntry],
     if prune:
         fresh_ids = {entry.msgid for entry in fresh}
         archive = [entry for entry in archive if entry.msgstr.strip() or entry.msgid in fresh_ids]
-    known = {entry.msgid for entry in archive}
-    merged = archive + [entry for entry in fresh if entry.msgid not in known]
+    merged = list(archive)
+    by_msgid = {entry.msgid: entry for entry in archive}
+    for entry in fresh:
+        existing = by_msgid.get(entry.msgid)
+        if existing is None:
+            merged.append(entry)
+            continue
+        if not existing.msgstr.strip():
+            existing.msgstr = entry.msgstr
+        comments = (existing.comment or "").split("\n")
+        for line in (entry.comment or "").split("\n"):
+            if line and line not in comments:
+                comments.append(line)
+        existing.comment = "\n".join(comments)
+        for occurrence in entry.occurrences:
+            if list(occurrence) not in [list(known) for known in existing.occurrences]:
+                existing.occurrences.append(occurrence)
     order = {category: index for index, category in enumerate(ALL_CATEGORIES)}
-    merged.sort(key=lambda item: (order[getattr(item, "category", None)], item.msgid))
+    # An entry from another producer (the instance audit) may arrive without a
+    # category; sort those last instead of refusing to write the file.
+    merged.sort(key=lambda item: (order.get(getattr(item, "category", None), len(order)),
+                                  item.msgid))
     return merged
 
 
@@ -167,23 +226,73 @@ def module_of(entry: polib.POEntry) -> str:
     return ""
 
 
-def write_fragment(path: Path, lang: str, entries: list[polib.POEntry], modules: list[str]) -> None:
-    title = (f"Odoo {lang} translation worklist -- {', '.join(modules)}\n"
-             f"Fill in the msgstr of every entry, then merge with i18n_apply.py.")
-    blocks = [po_header(lang, GENERATOR, title)]
+HEADER_DATE_RE = re.compile(r'^"(POT-Creation-Date|PO-Revision-Date): .*$', re.MULTILINE)
+
+
+def write_fragment(path: Path, lang: str, entries: list[polib.POEntry], modules: list[str],
+                   generator: str = GENERATOR, title: str | None = None) -> None:
+    """Write one worklist file, keeping the header dates of the previous revision.
+
+    Rewriting the timestamps of every worklist on every scan would put a diff in
+    each of them for nothing: they only change when the file is new.
+    """
+    title = title or (f"Odoo {lang} translation worklist -- {', '.join(modules)}\n"
+                      f"Fill in the msgstr of every entry, then merge with i18n_apply.py.")
+    header = po_header(lang, generator, title)
+    if path.is_file():
+        previous = {match.group(1): match.group(0)
+                    for match in HEADER_DATE_RE.finditer(path.read_text(encoding="utf-8"))}
+        for field, line in previous.items():
+            header = HEADER_DATE_RE.sub(
+                lambda match, field=field, line=line: line if match.group(1) == field else match.group(0),
+                header)
+    blocks = [header]
     for entry in entries:
         blocks.append(polib.POEntry.__unicode__(entry, 78).rstrip("\n"))
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n\n".join(blocks) + "\n", encoding="utf-8")
 
 
+def describe(names: list[str], limit: int = 12) -> str:
+    """Module names, with a count when the list is long."""
+    if len(names) <= limit:
+        return ", ".join(names)
+    return ", ".join(names[:limit]) + f", ... (+{len(names) - limit})"
+
+
+def print_coverage(stats: dict, args) -> None:
+    """Say out loud what the scan could not look at.
+
+    A scan is only as complete as the directories it was given: Odoo also loads
+    its own ``odoo/addons`` package directory (``base`` lives there) and the
+    data-dir addons path, and neither shows up in ``addons_path``.  A module the
+    scan never saw has to be reported, otherwise "nothing left to translate"
+    means "nothing I looked at".
+    """
+    missing: list[str] = stats.get("installed_not_scanned") or []
+    if missing:
+        print(f"\nCOVERAGE: {len(missing)} installed module(s) are not below the scanned "
+              f"addons dir(s):", file=args.log)
+        for name in missing:
+            print(f"  {name}", file=args.log)
+        print("  -> pass --config <odoo.conf> (or --root <project dir>) so the scan uses "
+              "every directory Odoo loads; alternatively --addons <dir>", file=args.log)
+    if stats["modules_without_pot"]:
+        print(f"\n{len(stats['modules_without_pot'])} module(s) ship no .pot, so a po-based "
+              f"scan cannot list their terms:", file=args.log)
+        print(f"  {describe(sorted(stats['modules_without_pot']))}", file=args.log)
+        print("  -> use i18n_db_audit.py for those: it reads what the instance serves",
+              file=args.log)
+
+
 def print_summary(stats: dict, total: int, args) -> None:
     print(f"modules scanned: {stats['modules_scanned']}", file=args.log)
-    if stats["modules_without_pot"]:
-        print(f"modules without a .pot (skipped): {len(stats['modules_without_pot'])}", file=args.log)
+    if stats.get("modules_seen"):
+        print(f"modules found below the addons dir(s): {stats['modules_seen']}", file=args.log)
     if stats["modules_without_po"]:
-        print(f"modules with no {args.lang} po file at all: {len(stats['modules_without_po'])}",
-              file=args.log)
+        print(f"modules with no {args.lang} po file at all (all terms missing): "
+              f"{len(stats['modules_without_po'])}", file=args.log)
+        print(f"  {describe(sorted(stats['modules_without_po']))}", file=args.log)
     print("\nuntranslated terms by category:", file=args.log)
     for category, count in stats["by_category"].items():
         if count:
@@ -239,6 +348,14 @@ def main() -> None:
     parser.add_argument("--addons", action="append", default=[], metavar="DIR",
                         help="addons directory to scan (repeatable); use every entry of "
                              "the project's addons_path")
+    parser.add_argument("--config", metavar="FILE",
+                        help="the project's odoo.conf: the scan then uses every addons "
+                             "directory that Odoo loads, including its own odoo/addons "
+                             "package directory (where base lives) and the data-dir one, "
+                             "which addons_path does not mention")
+    parser.add_argument("--root", metavar="DIR",
+                        help="the source tree to import Odoo from when --config cannot be "
+                             "read as an addons path (e.g. the project directory)")
     parser.add_argument("--lang", default="zh_CN", help="target language (default zh_CN)")
     parser.add_argument("--modules", help="comma separated module names to restrict to")
     parser.add_argument("--installed-db", metavar="DBNAME",
@@ -264,12 +381,25 @@ def main() -> None:
                              "_intentional.txt in --out-dir is read automatically")
     parser.add_argument("--summary", action="store_true", help="print the summary")
     args = parser.parse_args()
-    args.intentional = read_intentional(
-        [Path(raw).expanduser().resolve() for raw in args.intentional]
-        + ([Path(args.out_dir).expanduser().resolve()] if args.out_dir else []))
 
-    if not args.addons:
-        parser.error("--addons is required (give every directory of addons_path)")
+    roots, how = resolve_addons_paths(
+        Path(args.config).expanduser().resolve() if args.config else None,
+        Path(args.root).expanduser().resolve() if args.root else None,
+        [Path(raw).expanduser().resolve() for raw in args.addons])
+    if not roots:
+        parser.error("no addons directory found: give --addons, or --config with a "
+                     "readable addons_path")
+    # The project convention puts the deliberate omissions next to the worklists,
+    # so find them without being told; a scan that silently ignores them reports
+    # decisions already taken as work left.
+    auto_intentional = [root / "translations" / args.lang / INTENTIONAL_FILENAME
+                        for root in roots]
+    intentional_files = [Path(raw).expanduser().resolve() for raw in args.intentional]
+    if not intentional_files:
+        intentional_files = [path for path in auto_intentional if path.is_file()]
+    args.intentional = read_intentional(
+        intentional_files
+        + ([Path(args.out_dir).expanduser().resolve()] if args.out_dir else []))
     unknown = set(args.categories.split(",")) - set(ALL_CATEGORIES)
     if unknown:
         parser.error(f"unknown categories: {', '.join(sorted(unknown))}")
@@ -278,8 +408,10 @@ def main() -> None:
     args.log = sys.stderr if (args.out_dir or args.out) else sys.stdout
 
     only = set(filter(None, (args.modules or "").split(",")))
+    installed_known: list[str] = []
     if args.installed_db:
-        only |= set(installed_modules(args.installed_db))
+        installed_known = installed_modules(args.installed_db)
+        only |= set(installed_known)
     exclude = set(filter(None, (args.exclude_modules or "").split(",")))
 
     stats = {
@@ -304,9 +436,16 @@ def main() -> None:
         for name, translations in found.items():
             overlay.setdefault(name, {}).update(translations)
 
+    if how != "none" and (args.config or args.root):
+        print(f"addons dirs ({how}): " + ", ".join(str(root) for root in roots), file=args.log)
+
+    seen = {name for name, _path in iter_modules(roots)}
+    stats["modules_seen"] = len(seen)
+    if args.installed_db:
+        stats["installed_not_scanned"] = sorted(set(installed_known) - seen)
+
     all_entries: list[polib.POEntry] = []
-    for module, module_dir in iter_modules(
-            [Path(root).expanduser().resolve() for root in args.addons], only, exclude):
+    for module, module_dir in iter_modules(roots, only, exclude):
         entries = scan_module(module, module_dir, args, stats, overlay)
         if args.out_dir:
             if entries:
@@ -333,6 +472,7 @@ def main() -> None:
                 print(polib.POEntry.__unicode__(entry, 78).rstrip("\n"))
     if args.summary or not (args.out or args.out_dir):
         print_summary(stats, total, args)
+        print_coverage(stats, args)
 
 
 if __name__ == "__main__":

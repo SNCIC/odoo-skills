@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import re
+import subprocess
 import sys
 from collections import Counter
 from pathlib import Path
@@ -41,7 +42,12 @@ PLACEHOLDER_RE = re.compile(
     r"%(?:\((?P<name>[^)]*)\))?[-#0+]*\d*(?:\.\d+)?[diouxXeEfFgGcrsa%]")
 TAG_RE = re.compile(r"</?([A-Za-z][A-Za-z0-9]*)(?=[\s/>])")
 ENTITY_RE = re.compile(r"&(?:[a-zA-Z]+|#\d+|#x[0-9a-fA-F]+);")
-CJK_RE = re.compile(r"[\u3000-\u9fff\uf900-\ufaff]")
+# Han characters, plus the fullwidth forms a Chinese localisation drags along:
+# "(" -> "（" and ":" -> "：" are real translations even though they hold no
+# Han character, and warning about them buries the entries that really are
+# still English.  The word-separating space U+3000 is part of that group too.
+LOCALIZED_RE = re.compile(
+    r"[\u3000-\u9fff\uf900-\ufaff\uff01-\uff60\uffe0-\uffe6]")
 
 
 def collect_files(paths: list[str]) -> list[Path]:
@@ -94,7 +100,7 @@ def compare(entry: polib.POEntry) -> tuple[list[str], list[str]]:
 
     if msgstr == msgid:
         warnings.append("translation is identical to the source string")
-    elif not CJK_RE.search(msgstr):
+    elif not LOCALIZED_RE.search(msgstr):
         warnings.append("translation contains no Chinese characters")
     if msgid.count("\n") != msgstr.count("\n"):
         warnings.append(f"line breaks differ: {msgid.count(chr(10))} -> {msgstr.count(chr(10))}")
@@ -114,17 +120,57 @@ def report(entry: polib.POEntry, errors: list[str], warnings: list[str]) -> None
         print(f"WARNING {where}: {message}", file=sys.stderr)
 
 
-def check(entries: list[polib.POEntry], strict: bool) -> int:
-    """Report on the filled entries; return the number of errors."""
+def read_baseline(raw: str) -> dict[str, str]:
+    """The msgid -> msgstr of an already accepted state, for ``check --baseline``.
+
+    Accepts a po file, a directory of them (the overlay module's own
+    ``i18n/zh_CN.po`` is the usual choice), or ``<git-ref>:<path>``, which is
+    read with ``git show`` so a ref from before the current work can be used
+    without checking it out.
+    """
+    path = Path(raw).expanduser()
+    if path.exists():
+        entries = read_worklist(collect_files([str(path)]))
+    elif ":" in raw:
+        proc = subprocess.run(["git", "show", raw], capture_output=True, text=True)
+        if proc.returncode != 0:
+            sys.exit(f"{raw}: not a file, a directory or something git can show:\n"
+                     f"{proc.stderr.strip()}")
+        entries = list(polib.pofile(proc.stdout, encoding="utf-8"))
+    else:
+        sys.exit(f"no such file or directory: {path} "
+                 f"(or use <git-ref>:<path> to read one out of git)")
+    baseline = {entry.msgid: entry.msgstr for entry in entries
+                if entry.msgid and entry.msgstr.strip()}
+    if not baseline:
+        sys.exit(f"{raw}: the baseline holds no translated entry")
+    return baseline
+
+
+def check(entries: list[polib.POEntry], strict: bool,
+          baseline: dict[str, str] | None = None) -> tuple[int, int]:
+    """Report on the filled entries; return (problems, messages suppressed).
+
+    A baseline is the state that was already reviewed and accepted.  Worklists
+    are cumulative, so without one every run reprints the long-standing
+    warnings (labels that stay in English on purpose, "%s:" -> "%s：" and the
+    like) and nobody can see the messages this run introduced.  An entry counts
+    as old only when its msgstr is byte-identical to the accepted one.
+    """
     problems = 0
+    suppressed = 0
     for entry in entries:
         errors, warnings = compare(entry)
         if strict and warnings:
             errors, warnings = errors + warnings, []
+        if not errors and not warnings:
+            continue
+        if baseline is not None and baseline.get(entry.msgid) == entry.msgstr:
+            suppressed += len(errors) + len(warnings)
+            continue
         problems += len(errors)
-        if errors or warnings:
-            report(entry, errors, warnings)
-    return problems
+        report(entry, errors, warnings)
+    return problems, suppressed
 
 
 def merge_group(group: list[polib.POEntry]) -> polib.POEntry:
@@ -188,12 +234,17 @@ def cmd_check(args) -> int:
     files = collect_files(args.paths)
     entries = read_worklist(files)
     filled = [entry for entry in entries if entry.msgstr.strip()]
-    problems = check(filled, args.strict)
+    baseline = read_baseline(args.baseline) if args.baseline else None
+    problems, suppressed = check(filled, args.strict, baseline)
     intentional, stale = report_intentional(files, entries)
     if stale and args.strict:
         problems += stale
-    print(f"{len(files)} file(s), {len(filled)}/{len(entries)} entries translated, "
-          f"{intentional} intentionally kept in English, {problems} error(s)")
+    summary = [f"{len(files)} file(s), {len(filled)}/{len(entries)} entries translated",
+               f"{intentional} intentionally kept in English",
+               f"{problems} error(s)"]
+    if baseline is not None:
+        summary.append(f"{suppressed} message(s) already accepted by the baseline")
+    print(", ".join(summary))
     return 1 if problems else 0
 
 
@@ -204,7 +255,8 @@ def cmd_build(args) -> int:
     if not filled:
         print(f"nothing to build: {len(entries)} entries, none translated yet")
         return 0
-    if problems := check(filled, args.strict):
+    problems, _ = check(filled, args.strict)
+    if problems:
         print(f"{problems} error(s); fix them or blank out the msgstr of those entries",
               file=sys.stderr)
         return 1
@@ -218,12 +270,20 @@ def cmd_build(args) -> int:
     groups: dict[str, list[polib.POEntry]] = {}
     for entry in filled:
         groups.setdefault(entry.msgid, []).append(entry)
-    conflicts = {msgid: sorted({entry.msgstr for entry in group})
-                 for msgid, group in groups.items()
-                 if len({entry.msgstr for entry in group}) > 1}
+    conflicts: dict[str, dict[str, list[str]]] = {}
+    for msgid, group in groups.items():
+        variants: dict[str, list[str]] = {}
+        for entry in group:
+            variants.setdefault(entry.msgstr, []).append(Path(entry.worklist).name)
+        if len(variants) > 1:
+            conflicts[msgid] = variants
     if conflicts:
         for msgid, variants in sorted(conflicts.items())[:10]:
-            print(f"CONFLICT {msgid[:60]!r}: " + " | ".join(variants), file=sys.stderr)
+            # Which worklist each variant came from: the two files disagree and
+            # one of them has to give way, so name them.
+            detail = " | ".join(f"{text!r} ({', '.join(sorted(set(where)))})"
+                                for text, where in sorted(variants.items()))
+            print(f"CONFLICT {msgid[:60]!r}: {detail}", file=sys.stderr)
         sys.exit(f"{len(conflicts)} msgid(s) are translated in more than one way; "
                  f"a single po file can only hold one translation per msgid, so "
                  f"unify them in the worklists first")
@@ -267,6 +327,12 @@ def main() -> None:
                               help="worklist .po file(s), or a directory of them")
     check_parser.add_argument("--strict", action="store_true",
                               help="treat warnings as errors")
+    check_parser.add_argument("--baseline", metavar="PO|REF:PATH",
+                              help="accepted state, as a po file, a directory of "
+                                   "them or <git-ref>:<path> (e.g. the overlay "
+                                   "module's own i18n/zh_CN.po); entries whose "
+                                   "msgstr is unchanged from it are not reported, "
+                                   "so only the messages of this round show up")
     check_parser.set_defaults(func=cmd_check)
 
     build = subparsers.add_parser(

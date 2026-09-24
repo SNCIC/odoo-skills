@@ -19,6 +19,15 @@ file: the po is the source of truth of this module, and correcting a translation
 means editing it, which an ``overwrite=False`` import would silently ignore.
 Only the terms listed here are affected, and only for records that are not
 ``noupdate``; deleting an entry hands its term back to upstream.
+
+A module upgrade imports that module's own po file *after* these terms were
+written, and with ``overwrite=False``, so it cannot undo them -- but the upgrade
+itself can: re-reflecting a field (``ir.model.fields``, ``ir.model``) rewrites
+its source value and the other languages go with it, leaving the record English
+again while the entry is still in the po.  The worklists would then look
+complete and the instance would still serve the source text, which is why the
+digest does not stand alone: the import also repeats whenever a module row
+changed, i.e. after any install, upgrade or uninstall.
 """
 
 import hashlib
@@ -46,6 +55,17 @@ def po_signature():
     return digest.hexdigest()
 
 
+def module_marker(env):
+    """A marker of the module table, changed by any install/upgrade/removal.
+
+    An upgrade can leave a term English again without touching the po file (see
+    the module docstring), so the marker travels with the digest.
+    """
+    env.cr.execute("SELECT count(*), max(write_date) FROM ir_module_module")
+    count, write_date = env.cr.fetchone()
+    return f'{count}:{write_date}'
+
+
 class IrModuleModule(models.Model):
     _inherit = 'ir.module.module'
 
@@ -53,7 +73,7 @@ class IrModuleModule(models.Model):
         result = super()._register_hook()
         try:
             params = self.env['ir.config_parameter'].sudo()
-            signature = po_signature()
+            signature = f'{po_signature()}|{module_marker(self.env)}'
             if params.get_str(SIGNATURE_PARAM) != signature:
                 langs = [code for code, _name in self.env['res.lang'].get_installed()]
                 if langs:
