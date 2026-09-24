@@ -69,6 +69,16 @@ fuzzy entry with a non-empty `msgstr` is used exactly like a normal one, and
 coverage. `i18n_scan.py` accordingly counts only an empty `msgstr` as
 untranslated, and clears the `fuzzy` flag when it writes a real translation.
 
+A `msgstr` that repeats its `msgid` is the other case a coverage number gets
+wrong: the entry exists, the import stores it verbatim, and the record keeps
+serving the English text. Odoo's own po files are full of them -- brand names,
+symbols, demo data, format hints such as `PDF`, `X` or `John Doe`. They are a
+translator's decision rather than a gap, so `i18n_db_audit.py` reports them as
+their own group (`--list-unserved` marks them `=`) instead of counting them
+either as translated (`_intentional.txt` is the project's own list of the same
+idea) or as work. Prefilling a worklist from such an entry would write a
+`msgstr` identical to its `msgid`, which changes nothing on screen.
+
 ## Code terms
 
 `CodeTranslations` (translate.py:2579) is a process-wide singleton
@@ -117,6 +127,20 @@ with the translation: if the record's own value was edited in the database (a
 customized mail template, an edited payment message), its text is not the po
 `msgid` any more, and the importer has nothing to match. Comparing the worklist
 entry with the record (`with_context(lang='zh_CN')`) tells the two cases apart.
+
+The occurrence is what delivers a translation, not the msgid. An entry reaches
+exactly the records its `#:` lines name, so an English text that is translated
+in the module's po for *some* record stays English on every record no entry
+names -- the importer never looks the text up by itself. Markup is finer still:
+`html_translate` merges node by node, so a view keeps the nodes whose text no
+entry carries even when the rest of the same view is translated. This is the
+middle group `i18n_db_audit.py` reports ("translated somewhere, but no po entry
+points at the record"): the wording exists, the overlay has to add the
+occurrence, and the audit's worklist fills in that wording so nobody retranslates
+it. Field labels (`ir.model.fields.field_description`), model names, selection
+values and help texts are where this bites hardest, because the pot lists them
+per module while the records are shared.
+
 The pots can also lag behind the source -- upstream regenerates them in batches
 -- so a worklist entry may name a record that has not contained that term for a
 while. Such an entry is harmless: it translates the module's own text and starts
@@ -161,10 +185,21 @@ that module has to do, and why:
   overlay therefore imports its own po file again from
   `models/ir_module_module.py::_register_hook`, which Odoo calls once with the
   complete registry (`odoo/modules/loading.py`, "STEP 9: call _register_hook on
-  every model"). A `sha256` of the po files is kept in
+  every model"). A `sha256` of the po files plus a marker of the module table
+  (`count(*):max(write_date)` of `ir_module_module`) is kept in
   `ir.config_parameter` (`sn_odoo20_translations.po_signature`) so the import
-  runs only when the files actually changed; a plain service restart is enough
-  after a rebuild, no `-u` needed.
+  runs only when one of the two actually changed; a plain service restart is
+  enough after a rebuild, no `-u` needed. The marker is what recovers a term
+  after a module upgrade (see below).
+- **An upgrade can drop a translation the overlay wrote.** `-u <module>`
+  re-imports that module's own po *after* the overlay's terms were written, and
+  with `overwrite=False`, so it cannot undo them -- but re-reflecting a field
+  (`ir.model.fields.help`, `ir.model.name`, ...) rewrites the source value, and
+  the other languages go with it. The record is English again while the po entry
+  is still there, which no po digest can notice, and the module's own po then
+  refills the gap with whatever wording *it* has -- possibly one that predates
+  the current source text. Hence the module-table marker above: the overlay
+  imports once more after any install, upgrade or uninstall.
 - **`overwrite=False` in both paths.** The importer only fills translations that
   are not stored yet, so re-running is always safe and never undoes an edit made
   in the UI. Consequences worth knowing:
@@ -174,7 +209,16 @@ that module has to do, and why:
     does not translate stays in the source language. That is why a partially
     translated view can show mixed languages after a fresh import.
   - a `model:` entry only ever replaces a missing language key, never an
-    existing one.
+    existing one, and it is matched on its **xmlid alone**:
+    `TranslationImporter._load` keys it as
+    `model_translations[model][field][xmlid][lang]`, so the entry's `msgid` is
+    never compared with the record's value. A po whose msgid predates an
+    upstream edit of the text (`ir.model.fields.help`, a module `summary`)
+    therefore still gets imported by an upgrade, with the wording of the older
+    text. `model_terms:` is the other way round: it is keyed as
+    `[xmlid][src][lang]` and merged node by node, so a stale msgid there reaches
+    nothing at all. `i18n_db_audit.py` reports the first case with a `~` and the
+    po file that holds the entry.
 
 ## The .pot files
 
